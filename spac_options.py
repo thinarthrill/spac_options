@@ -287,32 +287,15 @@ def load_state() -> dict:
 def save_state(state: dict) -> None:
     gcs_save_json(state)
 
-def main_loop():
-    if not WATCHLIST:
-        logging.error("WATCHLIST пуст. Укажите тикеры в переменной окружения WATCHLIST.")
-    else:
-        logging.info(f"Watchlist: {', '.join(WATCHLIST)}")
-
-    if not GCS_BUCKET:
-        logging.error("GCS_BUCKET не задан — завершение.")
-        return
-
-    state = load_state()
-    logging.info("SPAC Options Monitor запущен.")
-    while True:
-        start_ts = time.time()
-        for tkr in WATCHLIST:
-            try:
-                process_ticker(tkr, state)
-            except Exception as e:
-                logging.warning(f"{tkr}: ошибка обработки: {e}")
-            time.sleep(YF_SLEEP_BETWEEN_TICKERS)
-
-        save_state(state)
-        elapsed = time.time() - start_ts
-        sleep_for = max(1, CHECK_INTERVAL_SEC - int(elapsed))
-        logging.info(f"Цикл завершён за {int(elapsed)}с. Пауза {sleep_for}с.")
-        time.sleep(sleep_for)
-
 if __name__ == "__main__":
-    main_loop()
+    state = load_state()
+    logging.info(f"Запуск проверки {len(WATCHLIST)} тикеров...")
+    for tkr in WATCHLIST:
+        try:
+            process_ticker(tkr, state)
+        except Exception as e:
+            logging.warning(f"{tkr}: ошибка обработки: {e}")
+        time.sleep(YF_SLEEP_BETWEEN_TICKERS)
+    save_state(state)
+    logging.info("✅ Проверка завершена")
+
