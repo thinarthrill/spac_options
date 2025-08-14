@@ -1,0 +1,5 @@
+yfinance
+pandas
+requests
+python-dotenv
+google-cloud-storage
