@@ -1,7 +1,7 @@
-# catalyst_watch.py
-import os, json, time, logging, math, requests
+# catalyst_watch.py (resilient)
+import os, json, time, logging, requests, math
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, Set, List, Tuple
+from typing import Set, List, Tuple
 from bs4 import BeautifulSoup
 import yfinance as yf
 from google.cloud import storage
@@ -13,11 +13,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 # ==== ENV ====
 PRICE_MIN = float(os.getenv("CAT_PRICE_MIN", "3.0"))
 PRICE_MAX = float(os.getenv("CAT_PRICE_MAX", "15.0"))
-VOL_SPIKE_MULT = float(os.getenv("CAT_VOL_SPIKE_MULT", "3.0"))   # во сколько раз выше среднего 10дн
-PRICE_MOVE_PCT = float(os.getenv("CAT_PRICE_MOVE_PCT", "8.0"))   # % за день
-NEWS_MIN = int(os.getenv("CAT_NEWS_MIN", "1"))                   # мин. число свежих новостей/файлингов
+VOL_SPIKE_MULT = float(os.getenv("CAT_VOL_SPIKE_MULT", "3.0"))
+PRICE_MOVE_PCT = float(os.getenv("CAT_PRICE_MOVE_PCT", "8.0"))
+NEWS_MIN = int(os.getenv("CAT_NEWS_MIN", "1"))
 YF_SLEEP = float(os.getenv("CAT_YF_SLEEP", "0.6"))
-SEC_DAYS_BACK = int(os.getenv("SEC_DAYS_BACK", "14"))            # глубина для 10-12B
+SEC_DAYS_BACK = int(os.getenv("SEC_DAYS_BACK", "14"))
+CAT_TEST_LIMIT = int(os.getenv("CAT_TEST_LIMIT", "0"))  # 0 = без лимита
+
+# сеть/таймауты
+REQ_TIMEOUT = int(os.getenv("REQ_TIMEOUT", "25"))
+REQ_RETRIES = int(os.getenv("REQ_RETRIES", "3"))
+REQ_BACKOFF = float(os.getenv("REQ_BACKOFF", "1.8"))
+NASDAQ_DISABLED = os.getenv("NASDAQ_DISABLED", "0") == "1"
 
 GCS_BUCKET = os.getenv("GCS_BUCKET")
 CAT_WATCHLIST_GCS_BLOB = os.getenv("CAT_WATCHLIST_GCS_BLOB", "catalyst/watchlist.txt")
@@ -32,7 +39,7 @@ def _get_gcs():
     if _gcs: return _gcs
     key_str = os.getenv("GCS_KEY_JSON") or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     if not key_str:
-        raise ValueError("❌ Нет ключа GCS (GCS_KEY_JSON или GOOGLE_APPLICATION_CREDENTIALS)")
+        raise ValueError("No GCS key (GCS_KEY_JSON or GOOGLE_APPLICATION_CREDENTIALS)")
     with open("gcs_key.json", "w", encoding="utf-8") as f:
         json.dump(json.loads(key_str), f)
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "gcs_key.json"
@@ -60,57 +67,88 @@ def tg_send(text: str):
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
-            timeout=20,
+            timeout=REQ_TIMEOUT,
         )
     except Exception as e:
         logging.warning(f"TG send error: {e}")
 
-# ==== Источник 1: IPO (Nasdaq) ====
+# ==== сетевой helper с ретраями ====
+def http_get(url: str, headers: dict = None, params: dict = None) -> requests.Response:
+    headers = {"User-Agent": "Mozilla/5.0"} | (headers or {})
+    last_err = None
+    for i in range(REQ_RETRIES):
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=REQ_TIMEOUT)
+            if r.status_code == 200:
+                return r
+            last_err = Exception(f"HTTP {r.status_code}")
+        except Exception as e:
+            last_err = e
+        sleep_s = REQ_BACKOFF ** i
+        logging.info(f"[GET retry {i+1}/{REQ_RETRIES}] {url} ({last_err}); sleep {sleep_s:.1f}s")
+        time.sleep(sleep_s)
+    raise last_err or Exception("request failed")
+
+def http_post_json(url: str, body: dict, headers: dict = None) -> requests.Response:
+    headers = {"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"} | (headers or {})
+    last_err = None
+    for i in range(REQ_RETRIES):
+        try:
+            r = requests.post(url, json=body, headers=headers, timeout=REQ_TIMEOUT)
+            if r.status_code == 200:
+                return r
+            last_err = Exception(f"HTTP {r.status_code}")
+        except Exception as e:
+            last_err = e
+        sleep_s = REQ_BACKOFF ** i
+        logging.info(f"[POST retry {i+1}/{REQ_RETRIES}] {url} ({last_err}); sleep {sleep_s:.1f}s")
+        time.sleep(sleep_s)
+    raise last_err or Exception("request failed")
+
+# ==== Источник 1: IPO (Nasdaq) + запасной (StockAnalysis) ====
 def fetch_nasdaq_ipos() -> Set[str]:
-    """
-    Тянем таблицы с https://www.nasdaq.com/market-activity/ipos (recent/upcoming).
-    Берём первый столбец (тикер). Сайт иногда меняет вёрстку — держим парсинг максимально устойчивым.
-    """
+    if NASDAQ_DISABLED:
+        logging.info("Nasdaq IPO fetch disabled by env")
+        return set()
     url = "https://www.nasdaq.com/market-activity/ipos"
-    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
-    r.raise_for_status()
+    r = http_get(url)
     soup = BeautifulSoup(r.text, "html.parser")
     tickers: Set[str] = set()
-
-    # Любая таблица на странице: ищем ячейки, похожие на тикер
     for table in soup.find_all("table"):
         for row in table.find_all("tr"):
-            cols = row.find_all("td")
-            if not cols: continue
-            t = cols[0].get_text(strip=True).upper()
-            # тикер: 1-5 латинских букв (допускаем .U/.W для юнитов/варрантов, но обрежем до базы)
-            base = t.replace(".U", "").replace(".W", "")
+            tds = row.find_all("td")
+            if not tds: continue
+            t = tds[0].get_text(strip=True).upper()
+            base = t.replace(".U","").replace(".W","")
             if 1 <= len(base) <= 5 and base.isalpha():
                 tickers.add(base)
     logging.info(f"Nasdaq IPO: {len(tickers)}")
     return tickers
 
+def fetch_stockanalysis_ipos() -> Set[str]:
+    # запасной источник: простая таблица
+    url = "https://stockanalysis.com/ipos/"
+    r = http_get(url)
+    soup = BeautifulSoup(r.text, "html.parser")
+    tickers: Set[str] = set()
+    for a in soup.select("table a[href*='/ipos/']"):
+        t = a.get_text(strip=True).upper()
+        base = t.replace(".U","").replace(".W","")
+        if 1 <= len(base) <= 5 and base.isalpha():
+            tickers.add(base)
+    logging.info(f"StockAnalysis IPO: {len(tickers)}")
+    return tickers
+
 # ==== Источник 2: Spin-offs (SEC 10-12B) ====
 def fetch_sec_spinoffs(days_back: int = 14) -> Set[str]:
-    """
-    Официальный SEC search-index (без сторонних сервисов).
-    Берём последние формы 10-12B за days_back дней и собираем тикеры.
-    """
-    # API индекса: https://efts.sec.gov/LATEST/search-index
-    # Ограничим размер, чтобы не злоупотреблять.
     since = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%d")
     body = {
         "query": {"query_string": {"query": f'formType:"10-12B" AND filedAt:>={since}'}},
-        "from": 0,
-        "size": 200,
+        "from": 0, "size": 200,
         "sort": [{"filedAt": {"order": "desc"}}],
         "highlight": False,
     }
-    r = requests.post("https://efts.sec.gov/LATEST/search-index", json=body, timeout=30,
-                      headers={"User-Agent":"Mozilla/5.0"})
-    if r.status_code != 200:
-        logging.warning(f"SEC 10-12B request failed: {r.status_code} {r.text[:200]}")
-        return set()
+    r = http_post_json("https://efts.sec.gov/LATEST/search-index", body)
     data = r.json()
     hits = data.get("hits", {}).get("hits", [])
     res: Set[str] = set()
@@ -130,11 +168,8 @@ def get_hist(ticker: str):
     return hist if hist is not None and not hist.empty else None
 
 def volume_spike(hist) -> Tuple[bool, float, float]:
-    """
-    Сравниваем последний объём с SMA(10) предыдущих дней.
-    """
     vol = hist["Volume"].dropna()
-    if len(vol) < 12:  # нужен хотя бы ~10 дней истории + текущий
+    if len(vol) < 12:
         return (False, 0.0, 0.0)
     last = float(vol.iloc[-1])
     base = float(vol.iloc[-11:-1].mean())
@@ -143,9 +178,6 @@ def volume_spike(hist) -> Tuple[bool, float, float]:
     return (last >= VOL_SPIKE_MULT * base, last, base)
 
 def price_move(hist) -> Tuple[bool, float]:
-    """
-    % изменения: последний Close vs предыдущий Close.
-    """
     close = hist["Close"].dropna()
     if len(close) < 2:
         return (False, 0.0)
@@ -157,24 +189,16 @@ def in_price_range(hist) -> Tuple[bool, float]:
     return (PRICE_MIN <= last_close <= PRICE_MAX, last_close)
 
 def recent_news_count_yf(ticker: str, hours: int = 24) -> int:
-    """
-    Пытаемся взять свежие новости через yfinance (если есть).
-    Считаем записи за последние 'hours' часов.
-    """
     try:
         t = yf.Ticker(ticker)
-        # yfinance>=0.2.40: t.news -> список словарей с providerPublishTime (unix)
         news = getattr(t, "news", []) or []
         if not isinstance(news, list):
             return 0
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
         cnt = 0
         for n in news:
-            ts = n.get("providerPublishTime")
-            if ts is None:  # иногда поле другое
-                ts = n.get("providerPublishTimeUtc")
-            if ts is None:
-                continue
+            ts = n.get("providerPublishTime") or n.get("providerPublishTimeUtc")
+            if ts is None: continue
             dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
             if dt >= cutoff:
                 cnt += 1
@@ -183,46 +207,33 @@ def recent_news_count_yf(ticker: str, hours: int = 24) -> int:
         return 0
 
 def recent_filings_count_sec(ticker: str, hours: int = 24) -> int:
-    """
-    Считаем свежие 8-K/PR-похожие файлинги за последние 'hours' часов через SEC search-index.
-    """
     cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S")
     q = {
         "query": {"query_string": {"query": f'ticker:"{ticker}" AND filedAt:>={cutoff} AND (formType:"8-K" OR formType:"6-K")'}},
         "from": 0, "size": 50,
-        "sort": [{"filedAt": {"order": "desc"}}],
-        "highlight": False,
+        "sort": [{"filedAt": {"order": "desc"}}], "highlight": False,
     }
     try:
-        r = requests.post("https://efts.sec.gov/LATEST/search-index", json=q, timeout=25,
-                          headers={"User-Agent":"Mozilla/5.0"})
-        if r.status_code != 200:
-            return 0
+        r = http_post_json("https://efts.sec.gov/LATEST/search-index", q)
         data = r.json()
         return int(data.get("hits", {}).get("total", {}).get("value", 0))
     except Exception:
         return 0
 
-# ==== Финальный проход ====
 def analyze_ticker(ticker: str):
     hist = get_hist(ticker)
     if hist is None: return None
-
     in_rng, last_px = in_price_range(hist)
-    if not in_rng:
-        return None
+    if not in_rng: return None
 
     v_spike, v_last, v_base = volume_spike(hist)
     p_move, pct = price_move(hist)
-
     news_yf = recent_news_count_yf(ticker, hours=24)
     filings = recent_filings_count_sec(ticker, hours=24)
     news_total = news_yf + filings
-    news_hit = news_total >= NEWS_MIN
 
-    hit = v_spike or p_move or news_hit
-    if not hit:
-        return None
+    hit = v_spike or p_move or (news_total >= NEWS_MIN)
+    if not hit: return None
 
     return {
         "ticker": ticker,
@@ -236,39 +247,63 @@ def analyze_ticker(ticker: str):
         "filings_24h": int(filings),
     }
 
+# ==== Watchlist сбор с fallback ====
 def fetch_watchlist() -> List[str]:
-    # Собираем свежий список: IPO (Nasdaq) + спин-оффы (SEC 10-12B)
-    ipos = fetch_nasdaq_ipos()
-    spins = fetch_sec_spinoffs(days_back=SEC_DAYS_BACK)
-    all_tick = sorted(ipos.union(spins))
-    # Сохраняем «источник истины» в GCS
-    if GCS_BUCKET and all_tick:
+    tickers: Set[str] = set()
+    # 1) Nasdaq (с ретраями)
+    try:
+        if not NASDAQ_DISABLED:
+            tickers |= fetch_nasdaq_ipos()
+    except Exception as e:
+        logging.warning(f"Nasdaq IPO failed: {e}")
+    # 2) StockAnalysis как запасной
+    if not tickers:
+        try:
+            tickers |= fetch_stockanalysis_ipos()
+        except Exception as e:
+            logging.warning(f"StockAnalysis IPO failed: {e}")
+    # 3) SEC 10-12B
+    try:
+        tickers |= fetch_sec_spinoffs(days_back=SEC_DAYS_BACK)
+    except Exception as e:
+        logging.warning(f"SEC 10-12B failed: {e}")
+
+    all_tick = sorted(tickers)
+    logging.info(f"Watchlist collected: {len(all_tick)} tickers")
+
+    # Сохраняем в GCS; если пусто — берём кэш
+    if all_tick and GCS_BUCKET:
         gcs_save_text(GCS_BUCKET, CAT_WATCHLIST_GCS_BLOB, "\n".join(all_tick))
-    # Если вдруг страница упала — берём прошлый список из GCS
     if not all_tick and GCS_BUCKET:
         cached = gcs_load_text(GCS_BUCKET, CAT_WATCHLIST_GCS_BLOB, "")
         all_tick = [t.strip().upper() for t in cached.splitlines() if t.strip()]
+        logging.info(f"Loaded cached watchlist: {len(all_tick)} from GCS")
+
+    # тест-лимит
+    if CAT_TEST_LIMIT and len(all_tick) > CAT_TEST_LIMIT:
+        all_tick = all_tick[:CAT_TEST_LIMIT]
+        logging.info(f"TEST MODE: limiting to {CAT_TEST_LIMIT} tickers")
+
     return all_tick
 
 def main():
     watch = fetch_watchlist()
-    logging.info(f"Watchlist size: {len(watch)}")
+    logging.info(f"Processing {len(watch)} tickers...")
 
     hits = []
-    for t in watch:
+    for i, t in enumerate(watch, 1):
         try:
+            logging.info(f"[{i}/{len(watch)}] {t}")
             res = analyze_ticker(t)
-            if res:
-                hits.append(res)
-            time.sleep(YF_SLEEP)
+            if res: hits.append(res)
         except Exception as e:
             logging.info(f"{t}: skip ({e})")
+        time.sleep(YF_SLEEP)
 
     if not hits:
         logging.info("No catalysts today in range.")
         return
 
-    # Формируем краткое уведомление и подробный хвост
     lines = []
     for h in hits[:60]:
         flags = []
@@ -279,7 +314,7 @@ def main():
 
     msg = (
         f"🚀 <b>Catalyst Watch</b> ${PRICE_MIN:.0f}–${PRICE_MAX:.0f}\n"
-        f"Триггеры: Vol≥{VOL_SPIKE_MULT}×, |Δ|≥{PRICE_MOVE_PCT}%, News≥{NEWS_MIN}\n"
+        f"Triggers: Vol≥{VOL_SPIKE_MULT}×, |Δ|≥{PRICE_MOVE_PCT}%, News≥{NEWS_MIN}\n"
         + "\n".join(lines)
     )
     tg_send(msg)
@@ -287,3 +322,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
